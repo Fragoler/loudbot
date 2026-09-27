@@ -40,12 +40,13 @@ const (
 )
 
 type Config struct {
-	Service    Service    `toml:"service"`
-	Telegram   Telegram   `toml:"telegram"`
-	Postgres   Postgres   `toml:"postgres"`
-	Moderation Moderation `toml:"moderation"`
-	Comments   Comments   `toml:"comments"`
-	Messages   Messages   `toml:"messages"`
+	Service    Service      `toml:"service"`
+	Telegram   Telegram     `toml:"telegram"`
+	Postgres   Postgres     `toml:"postgres"`
+	Moderation Moderation   `toml:"moderation"`
+	Comments   Comments     `toml:"comments"`
+	Posts      PostSettings `toml:"posts"`
+	Messages   Messages     `toml:"messages"`
 }
 
 type Service struct {
@@ -75,7 +76,10 @@ func (s Service) Location() (*time.Location, error) {
 type Telegram struct {
 	Mode        Mode   `toml:"mode"`
 	BotUsername string `toml:"bot_username"`
-	Debug       bool   `toml:"debug"`
+	// ChannelUsername builds public links to posts; empty falls back to the /c/
+	// form, which only members of a private channel can follow.
+	ChannelUsername string `toml:"channel_username"`
+	Debug           bool   `toml:"debug"`
 
 	// ChannelID is the channel the bot posts to and watches.
 	ChannelID int64 `toml:"channel_id"`
@@ -106,6 +110,16 @@ type Comments struct {
 	// DraftTTL bounds how long a deep-link tap stays valid, e.g. "1h" or "30m".
 	DraftTTL       string `toml:"draft_ttl"`
 	AnswerLinkText string `toml:"answer_link_text"`
+}
+
+// PostSettings are the suggestion flow's tunables. Named apart from the Posts
+// copy under Messages, which holds wording rather than behaviour.
+type PostSettings struct {
+	// MaxTextLen caps the body of a suggested post.
+	MaxTextLen int `toml:"max_text_len"`
+	// PendingLimit caps how many suggestions one account may have awaiting a
+	// decision, so one person cannot bury the moderators. Zero means no limit.
+	PendingLimit int `toml:"pending_limit"`
 }
 
 // TTL parses DraftTTL; Validate reports a malformed value separately.
@@ -173,6 +187,10 @@ func defaults() Config {
 			MaxTextLen: 3500,
 			DraftTTL:   "1h",
 		},
+		Posts: PostSettings{
+			MaxTextLen:   3500,
+			PendingLimit: 3,
+		},
 	}
 }
 
@@ -232,6 +250,14 @@ func (c Config) Validate() error {
 
 	if _, err := c.Comments.TTL(); err != nil {
 		errs = append(errs, err)
+	}
+
+	if c.Posts.MaxTextLen <= 0 {
+		errs = append(errs, fmt.Errorf("posts.max_text_len=%d must be positive", c.Posts.MaxTextLen))
+	}
+
+	if c.Posts.PendingLimit < 0 {
+		errs = append(errs, fmt.Errorf("posts.pending_limit=%d cannot be negative", c.Posts.PendingLimit))
 	}
 
 	errs = append(errs, c.Messages.validate()...)

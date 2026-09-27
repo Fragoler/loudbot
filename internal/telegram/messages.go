@@ -5,6 +5,7 @@ import (
 
 	"loudbot/internal/comment"
 	"loudbot/internal/config"
+	"loudbot/internal/suggestion"
 )
 
 // userMessage maps a core error onto the line the author sees. An unmapped error
@@ -12,6 +13,10 @@ import (
 func userMessage(m config.Messages, err error) string {
 	if rejected, ok := comment.Rejected(err); ok {
 		return rejected.Reason
+	}
+
+	if text, ok := suggestionMessage(m, err); ok {
+		return text
 	}
 
 	switch {
@@ -47,6 +52,20 @@ func userMessage(m config.Messages, err error) string {
 func expected(err error) bool {
 	if _, ok := comment.Rejected(err); ok {
 		return true
+	}
+
+	for _, sentinel := range []error{
+		suggestion.ErrEmptyPost,
+		suggestion.ErrTooLong,
+		suggestion.ErrNotYours,
+		suggestion.ErrNotPending,
+		suggestion.ErrTooManyPending,
+		suggestion.ErrNoDraft,
+		suggestion.ErrNotFound,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
 	}
 
 	for _, sentinel := range []error{

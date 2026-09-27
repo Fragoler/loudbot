@@ -146,3 +146,9 @@ func PostLink(post Post, channelID int64) string {
 
 	return fmt.Sprintf("https://t.me/c/%s/%d", internal, post.ChannelMessageID)
 }
+
+// ThreadLink opens the post's thread scrolled to one comment. The ?comment=
+// form works for both public and /c/ post links.
+func ThreadLink(post Post, channelID int64, messageID int) string {
+	return fmt.Sprintf("%s?comment=%d", PostLink(post, channelID), messageID)
+}

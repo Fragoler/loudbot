@@ -446,17 +446,22 @@ ORDER BY ua.granted_at, a.id`
 	return out, rows.Err()
 }
 
-// Activity counts what a user has published, replies told apart from comments.
+// Activity counts what a user has written: comments and replies told apart, and
+// suggested posts split by the stage they are at.
 func (s *Storage) Activity(ctx context.Context, userID int64) (profile.Activity, error) {
 	const q = `
 SELECT
-    count(*) FILTER (WHERE reply_to_comment_id IS NULL),
-    count(*) FILTER (WHERE reply_to_comment_id IS NOT NULL)
-FROM comments
-WHERE user_id = $1 AND status = $2`
+    (SELECT count(*) FROM comments
+      WHERE user_id = $1 AND status = $2 AND reply_to_comment_id IS NULL),
+    (SELECT count(*) FROM comments
+      WHERE user_id = $1 AND status = $2 AND reply_to_comment_id IS NOT NULL),
+    (SELECT count(*) FROM suggested_posts WHERE user_id = $1 AND status = 'published'),
+    (SELECT count(*) FROM suggested_posts WHERE user_id = $1 AND status = 'pending')`
 
 	var a profile.Activity
-	if err := s.pool.QueryRow(ctx, q, userID, comment.StatusPublished).Scan(&a.Comments, &a.Replies); err != nil {
+	err := s.pool.QueryRow(ctx, q, userID, comment.StatusPublished).
+		Scan(&a.Comments, &a.Replies, &a.Posts, &a.PostsPending)
+	if err != nil {
 		return profile.Activity{}, fmt.Errorf("count activity: %w", err)
 	}
 
@@ -509,7 +514,7 @@ SELECT
       WHERE user_id = $1 AND status = $2 AND reply_to_comment_id IS NULL),
     (SELECT count(*) FROM comments
       WHERE user_id = $1 AND status = $2 AND reply_to_comment_id IS NOT NULL),
-    (SELECT count(*) FROM suggested_posts WHERE user_id = $1 AND status = 'approved'),
+    (SELECT count(*) FROM suggested_posts WHERE user_id = $1 AND status = 'published'),
     (SELECT count(*) FROM user_achievements WHERE user_id = $1)`
 
 	var c achievement.Counters
@@ -538,7 +543,7 @@ ON CONFLICT DO NOTHING`
 	return tag.RowsAffected() > 0, nil
 }
 
-// CreateSuggestion records a post offered through Direct Messages.
+// CreateSuggestion records a post offered to the bot.
 func (s *Storage) CreateSuggestion(ctx context.Context, sug suggestion.Suggestion) (int64, error) {
 	media, err := json.Marshal(nonNilMedia(sug.Media))
 	if err != nil {
@@ -546,14 +551,12 @@ func (s *Storage) CreateSuggestion(ctx context.Context, sug suggestion.Suggestio
 	}
 
 	const q = `
-INSERT INTO suggested_posts (user_id, content_text, media_json, status, created_at, dm_chat_id, dm_message_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO suggested_posts (user_id, content_text, media_json, status, created_at)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING id`
 
 	var id int64
-	err = s.pool.QueryRow(ctx, q,
-		sug.UserID, sug.Text, media, sug.Status, sug.CreatedAt, sug.DMChatID, sug.DMMessageID,
-	).Scan(&id)
+	err = s.pool.QueryRow(ctx, q, sug.UserID, sug.Text, media, sug.Status, sug.CreatedAt).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("create suggestion: %w", err)
 	}
@@ -561,29 +564,22 @@ RETURNING id`
 	return id, nil
 }
 
-// SuggestionByMessage finds a suggestion by the Direct Messages message it was
-// offered in, which is all a decision's service message carries.
-func (s *Storage) SuggestionByMessage(ctx context.Context, chatID int64, messageID int) (suggestion.Suggestion, error) {
-	const q = `
+const suggestionColumns = `
 SELECT id, user_id, content_text, media_json, status,
-       COALESCE(dm_chat_id, 0), COALESCE(dm_message_id, 0), created_at
-FROM suggested_posts
-WHERE dm_chat_id = $1 AND dm_message_id = $2`
+       COALESCE(moderation_message_id, 0), COALESCE(channel_message_id, 0),
+       created_at, edited_at
+FROM suggested_posts`
 
+func scanSuggestion(row pgx.Row) (suggestion.Suggestion, error) {
 	var (
 		sug   suggestion.Suggestion
 		media []byte
 	)
 
-	err := s.pool.QueryRow(ctx, q, chatID, messageID).
-		Scan(&sug.ID, &sug.UserID, &sug.Text, &media, &sug.Status,
-			&sug.DMChatID, &sug.DMMessageID, &sug.CreatedAt)
+	err := row.Scan(&sug.ID, &sug.UserID, &sug.Text, &media, &sug.Status,
+		&sug.ModerationMessageID, &sug.ChannelMessageID, &sug.CreatedAt, &sug.EditedAt)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return suggestion.Suggestion{}, suggestion.ErrNotFound
-		}
-
-		return suggestion.Suggestion{}, fmt.Errorf("find suggestion: %w", err)
+		return suggestion.Suggestion{}, err
 	}
 
 	if err := json.Unmarshal(media, &sug.Media); err != nil {
@@ -593,7 +589,86 @@ WHERE dm_chat_id = $1 AND dm_message_id = $2`
 	return sug, nil
 }
 
-// SetSuggestionStatus records what an admin decided.
+func (s *Storage) Suggestion(ctx context.Context, id int64) (suggestion.Suggestion, error) {
+	sug, err := scanSuggestion(s.pool.QueryRow(ctx, suggestionColumns+` WHERE id = $1`, id))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return suggestion.Suggestion{}, suggestion.ErrNotFound
+		}
+
+		return suggestion.Suggestion{}, fmt.Errorf("find suggestion %d: %w", id, err)
+	}
+
+	return sug, nil
+}
+
+// SuggestionsByStatus lists one author's suggestions, newest first.
+func (s *Storage) SuggestionsByStatus(
+	ctx context.Context, userID int64, statuses ...suggestion.Status,
+) ([]suggestion.Suggestion, error) {
+	rows, err := s.pool.Query(ctx,
+		suggestionColumns+` WHERE user_id = $1 AND status = ANY($2::text[]) ORDER BY id DESC`,
+		userID, statusNames(statuses))
+	if err != nil {
+		return nil, fmt.Errorf("list suggestions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []suggestion.Suggestion
+	for rows.Next() {
+		sug, err := scanSuggestion(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan suggestion: %w", err)
+		}
+		out = append(out, sug)
+	}
+
+	return out, rows.Err()
+}
+
+// CountSuggestions totals one author's suggestions in the given states.
+func (s *Storage) CountSuggestions(
+	ctx context.Context, userID int64, statuses ...suggestion.Status,
+) (int, error) {
+	const q = `SELECT count(*) FROM suggested_posts WHERE user_id = $1 AND status = ANY($2::text[])`
+
+	var n int
+	if err := s.pool.QueryRow(ctx, q, userID, statusNames(statuses)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count suggestions: %w", err)
+	}
+
+	return n, nil
+}
+
+// statusNames converts to the text[] the queries compare against.
+func statusNames(statuses []suggestion.Status) []string {
+	out := make([]string, 0, len(statuses))
+	for _, st := range statuses {
+		out = append(out, string(st))
+	}
+
+	return out
+}
+
+// UpdateSuggestionText replaces what an author offered, keeping the card the
+// moderators already have.
+func (s *Storage) UpdateSuggestionText(
+	ctx context.Context, id int64, text string, media []comment.Media, at time.Time,
+) error {
+	encoded, err := json.Marshal(nonNilMedia(media))
+	if err != nil {
+		return fmt.Errorf("encode suggestion media: %w", err)
+	}
+
+	const q = `UPDATE suggested_posts SET content_text = $2, media_json = $3, edited_at = $4 WHERE id = $1`
+
+	if _, err := s.pool.Exec(ctx, q, id, text, encoded, at); err != nil {
+		return fmt.Errorf("update suggestion %d: %w", id, err)
+	}
+
+	return nil
+}
+
 func (s *Storage) SetSuggestionStatus(
 	ctx context.Context, id int64, status suggestion.Status, decidedAt time.Time,
 ) error {
@@ -601,6 +676,66 @@ func (s *Storage) SetSuggestionStatus(
 
 	if _, err := s.pool.Exec(ctx, q, id, status, decidedAt); err != nil {
 		return fmt.Errorf("set suggestion %d status: %w", id, err)
+	}
+
+	return nil
+}
+
+func (s *Storage) SetModerationMessage(ctx context.Context, id int64, messageID int) error {
+	const q = `UPDATE suggested_posts SET moderation_message_id = $2 WHERE id = $1`
+
+	if _, err := s.pool.Exec(ctx, q, id, messageID); err != nil {
+		return fmt.Errorf("set moderation message for suggestion %d: %w", id, err)
+	}
+
+	return nil
+}
+
+func (s *Storage) SetChannelMessage(ctx context.Context, id int64, messageID int) error {
+	const q = `UPDATE suggested_posts SET channel_message_id = $2 WHERE id = $1`
+
+	if _, err := s.pool.Exec(ctx, q, id, messageID); err != nil {
+		return fmt.Errorf("set channel message for suggestion %d: %w", id, err)
+	}
+
+	return nil
+}
+
+func (s *Storage) SaveSuggestionDraft(ctx context.Context, draft suggestion.Draft) error {
+	const q = `
+INSERT INTO suggestion_drafts (user_id, editing_id, created_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (user_id) DO UPDATE
+SET editing_id = EXCLUDED.editing_id,
+    created_at = EXCLUDED.created_at`
+
+	if _, err := s.pool.Exec(ctx, q, draft.UserID, nullableID(draft.EditingID), draft.CreatedAt); err != nil {
+		return fmt.Errorf("save suggestion draft: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Storage) SuggestionDraft(ctx context.Context, userID int64) (suggestion.Draft, error) {
+	const q = `
+SELECT user_id, COALESCE(editing_id, 0), created_at
+FROM suggestion_drafts WHERE user_id = $1`
+
+	var d suggestion.Draft
+	if err := s.pool.QueryRow(ctx, q, userID).Scan(&d.UserID, &d.EditingID, &d.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return suggestion.Draft{}, suggestion.ErrNotFound
+		}
+
+		return suggestion.Draft{}, fmt.Errorf("suggestion draft: %w", err)
+	}
+
+	return d, nil
+}
+
+func (s *Storage) DeleteSuggestionDraft(ctx context.Context, userID int64) error {
+	if _, err := s.pool.Exec(ctx, `DELETE FROM suggestion_drafts WHERE user_id = $1`, userID); err != nil {
+		return fmt.Errorf("delete suggestion draft: %w", err)
 	}
 
 	return nil

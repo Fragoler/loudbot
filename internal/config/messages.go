@@ -25,10 +25,18 @@ type Messages struct {
 	Published      string `toml:"published"`
 	// Achievement is shown when a comment earns one; it takes the title.
 	Achievement string `toml:"achievement"`
-	Cancelled   string `toml:"cancelled"`
+	// ReplyNotice heads the message a comment's author gets when someone answers
+	// it; the reply's mask and words follow, with a button to the reply.
+	ReplyNotice       string `toml:"reply_notice"`
+	ButtonOpenComment string `toml:"button_open_comment"`
+	Cancelled         string `toml:"cancelled"`
 
 	// Profile is the /profile screen. Counters and lists are filled into it.
 	Profile Profile `toml:"profile"`
+	// Posts is the suggestion flow as its author sees it.
+	Posts Posts `toml:"posts"`
+	// ModerationCard is what moderators act on.
+	ModerationCard ModerationCard `toml:"moderation"`
 
 	Errors Errors `toml:"errors"`
 }
@@ -40,9 +48,53 @@ type Profile struct {
 	Title            string `toml:"title"`
 	Comments         string `toml:"comments"`
 	Replies          string `toml:"replies"`
+	Posts            string `toml:"posts"`
+	PostsPending     string `toml:"posts_pending"`
 	AchievementsHead string `toml:"achievements_head"`
 	NoAchievements   string `toml:"no_achievements"`
 	NicknamesHead    string `toml:"nicknames_head"`
+}
+
+// Posts is the wording of the suggestion flow: plain text, the bot adds markup.
+type Posts struct {
+	ButtonEdit     string `toml:"button_edit"`
+	ButtonWithdraw string `toml:"button_withdraw"`
+
+	Prompt     string `toml:"prompt"`
+	EditPrompt string `toml:"edit_prompt"`
+	Sent       string `toml:"sent"`
+	Edited     string `toml:"edited"`
+	Withdrawn  string `toml:"withdrawn"`
+
+	PendingHead    string `toml:"pending_head"`
+	PendingEmpty   string `toml:"pending_empty"`
+	PublishedHead  string `toml:"published_head"`
+	PublishedEmpty string `toml:"published_empty"`
+	// OpenPost labels the link to a published post.
+	OpenPost string `toml:"open_post"`
+	// Approved is what the author is told once the post actually goes out, and
+	// Declined when it is refused.
+	Approved string `toml:"approved"`
+	Declined string `toml:"declined"`
+}
+
+// ModerationCard is the wording of the moderators' card. Named apart from the
+// [moderation] section, which holds the chat id rather than any copy.
+type ModerationCard struct {
+	Head   string `toml:"head"`
+	Edited string `toml:"edited"`
+
+	ButtonApprove string `toml:"button_approve"`
+	ButtonDecline string `toml:"button_decline"`
+	ButtonConfirm string `toml:"button_confirm"`
+	ButtonCancel  string `toml:"button_cancel"`
+
+	Confirm string `toml:"confirm"`
+	// Published is stamped on the card once the post is in the channel.
+	Published string `toml:"published"`
+	Declined  string `toml:"declined"`
+	Withdrawn string `toml:"withdrawn"`
+	Failed    string `toml:"failed"`
 }
 
 // Errors is what an author is told when the bot refuses their message. Nothing
@@ -59,6 +111,12 @@ type Errors struct {
 	Empty          string `toml:"empty"`
 	TooLong        string `toml:"too_long"`
 	NothingStaged  string `toml:"nothing_staged"`
+	PostEmpty      string `toml:"post_empty"`
+	PostTooLong    string `toml:"post_too_long"`
+	PostNotYours   string `toml:"post_not_yours"`
+	PostNotPending string `toml:"post_not_pending"`
+	PostLimit      string `toml:"post_limit"`
+	NoPostDraft    string `toml:"no_post_draft"`
 	Unsupported    string `toml:"unsupported"`
 	Internal       string `toml:"internal"`
 }
@@ -73,23 +131,67 @@ func DefaultMessages() Messages {
 		ReplyLink:      "ответить",
 
 		Invite: "Комментарии к этому посту анонимные. Нажмите кнопку ниже — и пишите.",
-		Help: "Этот бот публикует анонимные комментарии.\n\n" +
+		Help: "Этот бот публикует анонимные комментарии и принимает посты.\n\n" +
 			"Нажмите «💬 Комментировать анонимно» под постом в канале — " +
-			"и напишите сюда текст или пришлите медиа.",
+			"и напишите сюда текст или пришлите медиа.\n\n" +
+			"/suggest — предложить пост\n" +
+			"/pending — предложки на рассмотрении\n" +
+			"/posts — ваши опубликованные посты\n" +
+			"/profile — ваша статистика",
 		Prompt:         "Напишите комментарий к посту — текстом или медиа.",
 		ReplyPrompt:    "Напишите ответ — текстом или медиа.",
 		ChooseNickname: "Под каким псевдонимом отправить?",
 		Published:      "Комментарий отправлен.",
 		Achievement:    "🏅 Новое достижение",
-		Cancelled:      "Черновик удалён. Напишите новый комментарий.",
+
+		ReplyNotice:       "💬 Вам ответили",
+		ButtonOpenComment: "Открыть комментарий",
+		Cancelled:         "Черновик удалён. Напишите новый комментарий.",
 
 		Profile: Profile{
 			Title:            "📊 Ваша статистика",
 			Comments:         "💬 Комментариев: %d",
 			Replies:          "↩️ Ответов: %d",
+			Posts:            "📣 Постов опубликовано: %d",
+			PostsPending:     "📝 На рассмотрении: %d",
 			AchievementsHead: "🏅 Достижения",
 			NoAchievements:   "Пока ни одного — они открывают новые псевдонимы.",
 			NicknamesHead:    "🎭 Доступные псевдонимы",
+		},
+
+		Posts: Posts{
+			ButtonEdit:     "✏️ Редактировать",
+			ButtonWithdraw: "🗑 Отменить",
+
+			Prompt:     "Пришлите текст поста — можно с медиа.",
+			EditPrompt: "Пришлите новый текст поста.",
+			Sent:       "Пост отправлен на рассмотрение.",
+			Edited:     "Пост обновлён — модераторы видят новый текст.",
+			Withdrawn:  "Предложка отменена.",
+
+			PendingHead:    "🕓 На рассмотрении",
+			PendingEmpty:   "Пока ничего не ждёт решения.",
+			PublishedHead:  "📣 Опубликованные посты",
+			PublishedEmpty: "Пока ни один ваш пост не вышел.",
+			OpenPost:       "Открыть пост",
+			Approved:       "✅ Ваш пост опубликован.",
+			Declined:       "❌ Ваш пост отклонён.",
+		},
+
+		ModerationCard: ModerationCard{
+			Head:   "📝 Предложка",
+			Edited: "изменено автором",
+
+			ButtonApprove: "✅ Одобрить",
+			ButtonDecline: "❌ Отклонить",
+			ButtonConfirm: "Одобрить",
+			ButtonCancel:  "Отменить",
+
+			Confirm:   "Опубликовать пост в канал?",
+			Published: "✅ Опубликовано",
+			Declined:  "❌ Отклонено",
+			Withdrawn: "🗑 Отменено автором",
+			Failed:    "⚠️ Не удалось опубликовать",
 		},
 
 		Errors: Errors{
@@ -104,6 +206,12 @@ func DefaultMessages() Messages {
 			Empty:          "Пустой комментарий: пришлите текст или медиа.",
 			TooLong:        "Комментарий слишком длинный, сократите текст.",
 			NothingStaged:  "Нечего отправлять — сначала напишите комментарий.",
+			PostEmpty:      "Пустой пост: пришлите текст или медиа.",
+			PostTooLong:    "Текст поста слишком длинный, сократите его.",
+			PostNotYours:   "Это чужая предложка.",
+			PostNotPending: "Решение по этой предложке уже принято.",
+			PostLimit:      "Слишком много предложек ждёт решения. Дождитесь ответа по предыдущим.",
+			NoPostDraft:    "Сначала начните предложку командой /suggest.",
 			Unsupported:    "Такой тип вложения не поддерживается.",
 			Internal:       "Что-то пошло не так, попробуйте ещё раз позже.",
 		},
@@ -124,10 +232,15 @@ func (m Messages) validate() []error {
 		"messages.reply_prompt":              m.ReplyPrompt,
 		"messages.choose_nickname":           m.ChooseNickname,
 		"messages.published":                 m.Published,
+		"messages.achievement":               m.Achievement,
+		"messages.reply_notice":              m.ReplyNotice,
+		"messages.button_open_comment":       m.ButtonOpenComment,
 		"messages.cancelled":                 m.Cancelled,
 		"messages.profile.title":             m.Profile.Title,
 		"messages.profile.comments":          m.Profile.Comments,
 		"messages.profile.replies":           m.Profile.Replies,
+		"messages.profile.posts":             m.Profile.Posts,
+		"messages.profile.posts_pending":     m.Profile.PostsPending,
 		"messages.profile.achievements_head": m.Profile.AchievementsHead,
 		"messages.profile.no_achievements":   m.Profile.NoAchievements,
 		"messages.profile.nicknames_head":    m.Profile.NicknamesHead,

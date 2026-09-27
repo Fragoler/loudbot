@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-telegram/bot/models"
@@ -14,6 +15,7 @@ import (
 	"loudbot/internal/comment"
 	"loudbot/internal/config"
 	"loudbot/internal/profile"
+	"loudbot/internal/suggestion"
 )
 
 func TestStartPayload(t *testing.T) {
@@ -237,7 +239,7 @@ func TestProfileText(t *testing.T) {
 	m := config.DefaultMessages().Profile
 
 	got := profileText(profile.Profile{
-		Activity: profile.Activity{Comments: 12, Replies: 4},
+		Activity: profile.Activity{Comments: 12, Replies: 4, Posts: 3, PostsPending: 2},
 		Achievements: []profile.Achievement{
 			{Title: "Полуночник", Description: "Длинный комментарий ночью"},
 			{Title: "Крикун"},
@@ -248,6 +250,8 @@ func TestProfileText(t *testing.T) {
 	assert.Contains(t, got, "<b>📊 Ваша статистика</b>")
 	assert.Contains(t, got, "💬 Комментариев: 12")
 	assert.Contains(t, got, "↩️ Ответов: 4")
+	assert.Contains(t, got, "📣 Постов опубликовано: 3")
+	assert.Contains(t, got, "📝 На рассмотрении: 2")
 	assert.Contains(t, got, "<b>🏅 Достижения (2)</b>", "a heading says how long its list is")
 	assert.Contains(t, got, "• <b>Полуночник</b>")
 	assert.Contains(t, got, "<i>Длинный комментарий ночью</i>")
@@ -265,6 +269,8 @@ func TestProfileTextWithNothingEarned(t *testing.T) {
 
 	got := profileText(profile.Profile{Nicknames: []comment.Nickname{{Label: "Лис"}}}, m)
 
+	assert.Contains(t, got, "📣 Постов опубликовано: 0")
+	assert.NotContains(t, got, "На рассмотрении", "the in-flight line stays out when nothing is in flight")
 	assert.Contains(t, got, "<b>🏅 Достижения</b>", "an empty list drops the count")
 	assert.NotContains(t, got, "Достижения (0)")
 	assert.Contains(t, got, "<i>"+m.NoAchievements+"</i>")
@@ -302,5 +308,137 @@ func TestAchievementText(t *testing.T) {
 	assert.Equal(t, "<b>🏅 Новое достижение</b>\n\n<b>Крикун</b>", bare)
 
 	escaped := achievementText(head, achievement.Granted{Title: "<b>взлом"})
+	assert.Contains(t, escaped, "&lt;b&gt;взлом")
+}
+
+func TestModerationCard(t *testing.T) {
+	t.Parallel()
+
+	m := config.DefaultMessages().ModerationCard
+
+	fresh := moderationCard(suggestion.Suggestion{ID: 7, Text: "Предлагаю котика"}, m)
+	assert.Equal(t, "<b>📝 Предложка #7</b>\n\nПредлагаю котика", fresh)
+
+	edited := time.Now()
+	changed := moderationCard(suggestion.Suggestion{ID: 7, Text: "Предлагаю котика", EditedAt: &edited}, m)
+	assert.Contains(t, changed, "изменено автором", "a moderator must see that the text moved under them")
+
+	// The post is written by a reader, so it cannot carry markup into the card.
+	escaped := moderationCard(suggestion.Suggestion{ID: 7, Text: "<b>взлом"}, m)
+	assert.Contains(t, escaped, "&lt;b&gt;взлом")
+
+	empty := moderationCard(suggestion.Suggestion{ID: 7}, m)
+	assert.Contains(t, empty, "—", "a media-only post still needs a body in the card")
+}
+
+func TestModerationKeyboardConfirmsBeforePublishing(t *testing.T) {
+	t.Parallel()
+
+	m := config.DefaultMessages().ModerationCard
+
+	first := moderationKeyboard(7, m).InlineKeyboard
+	require.Len(t, first, 1)
+	require.Len(t, first[0], 2)
+	assert.Equal(t, m.ButtonApprove, first[0][0].Text)
+	assert.Equal(t, m.ButtonDecline, first[0][1].Text)
+
+	action, id, ok := suggestion.ParseCallback(first[0][0].CallbackData)
+	require.True(t, ok)
+	assert.Equal(t, suggestion.ActionApprove, action, "the first tap only asks")
+	assert.Equal(t, int64(7), id)
+
+	// Declining is one tap: it publishes nothing and is not the dangerous one.
+	action, _, ok = suggestion.ParseCallback(first[0][1].CallbackData)
+	require.True(t, ok)
+	assert.Equal(t, suggestion.ActionDecline, action)
+
+	second := confirmKeyboard(7, m).InlineKeyboard
+	require.Len(t, second, 1)
+	require.Len(t, second[0], 2)
+	assert.Equal(t, m.ButtonConfirm, second[0][0].Text)
+	assert.Equal(t, m.ButtonCancel, second[0][1].Text)
+
+	action, _, ok = suggestion.ParseCallback(second[0][0].CallbackData)
+	require.True(t, ok)
+	assert.Equal(t, suggestion.ActionConfirm, action, "only the second tap publishes")
+
+	action, _, ok = suggestion.ParseCallback(second[0][1].CallbackData)
+	require.True(t, ok)
+	assert.Equal(t, suggestion.ActionAbort, action, "cancelling puts the first palette back")
+}
+
+func TestPublishedNotice(t *testing.T) {
+	t.Parallel()
+
+	m := config.DefaultMessages().Posts
+
+	withLink := publishedNotice(m, "https://t.me/my_channel/42")
+	assert.Contains(t, withLink, esc(m.Approved))
+	assert.Contains(t, withLink, `<a href="https://t.me/my_channel/42">`)
+	assert.Contains(t, withLink, esc(m.OpenPost))
+
+	// A post with no link still gets the news.
+	assert.Equal(t, esc(m.Approved), publishedNotice(m, ""))
+}
+
+func TestAuthorKeyboard(t *testing.T) {
+	t.Parallel()
+
+	m := config.DefaultMessages().Posts
+
+	rows := authorKeyboard(suggestion.Suggestion{ID: 7}, m).InlineKeyboard
+	require.Len(t, rows, 1)
+	require.Len(t, rows[0], 2)
+
+	edit, _, ok := suggestion.ParseCallback(rows[0][0].CallbackData)
+	require.True(t, ok)
+	assert.Equal(t, suggestion.ActionEdit, edit)
+
+	drop, _, ok := suggestion.ParseCallback(rows[0][1].CallbackData)
+	require.True(t, ok)
+	assert.Equal(t, suggestion.ActionWithdraw, drop)
+}
+
+func TestSuggestionMessagesAreMapped(t *testing.T) {
+	t.Parallel()
+
+	m := config.DefaultMessages()
+
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{err: suggestion.ErrEmptyPost, want: m.Errors.PostEmpty},
+		{err: suggestion.ErrTooLong, want: m.Errors.PostTooLong},
+		{err: suggestion.ErrNotYours, want: m.Errors.PostNotYours},
+		{err: suggestion.ErrNotPending, want: m.Errors.PostNotPending},
+		{err: suggestion.ErrTooManyPending, want: m.Errors.PostLimit},
+		{err: suggestion.ErrNoDraft, want: m.Errors.NoPostDraft},
+		{err: suggestion.ErrNotFound, want: m.Errors.NoPostDraft},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tc.want, userMessage(m, tc.err))
+			assert.True(t, expected(tc.err), "these are outcomes of user input, not failures")
+		})
+	}
+}
+
+func TestReplyNoticeText(t *testing.T) {
+	t.Parallel()
+
+	head := config.DefaultMessages().ReplyNotice
+
+	got := replyNoticeText(head, comment.ReplyNotice{Nickname: "Сова", Text: "а где продолжение?"})
+	assert.Equal(t, "<b>💬 Вам ответили</b>\n\n<b>Сова</b>\nа где продолжение?", got)
+
+	mediaOnly := replyNoticeText(head, comment.ReplyNotice{Nickname: "Сова"})
+	assert.Equal(t, "<b>💬 Вам ответили</b>\n\n<b>Сова</b>", mediaOnly)
+
+	escaped := replyNoticeText(head, comment.ReplyNotice{Nickname: "<i>Сова", Text: "<b>взлом"})
+	assert.Contains(t, escaped, "&lt;i&gt;Сова")
 	assert.Contains(t, escaped, "&lt;b&gt;взлом")
 }

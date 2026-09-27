@@ -6,7 +6,6 @@ import (
 	"html"
 	"log/slog"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	tgbot "github.com/go-telegram/bot"
@@ -20,8 +19,11 @@ import (
 )
 
 const (
-	startCommand   = "/start"
-	profileCommand = "/profile"
+	startCommand     = "/start"
+	profileCommand   = "/profile"
+	suggestCommand   = "/suggest"
+	pendingCommand   = "/pending"
+	publishedCommand = "/posts"
 	// quoteLimit keeps the quoted post short enough to stay a hint rather than a
 	// wall of text above the author's own message.
 	quoteLimit = 280
@@ -29,38 +31,12 @@ const (
 
 func (b *Bot) handleUpdate(ctx context.Context, _ *tgbot.Bot, update *models.Update) {
 	switch {
-	case update.ChannelPost != nil:
-		b.onChannelPost(ctx, update.ChannelPost)
 	case update.CallbackQuery != nil:
 		b.onCallback(ctx, update.CallbackQuery)
-	case update.Message != nil && update.Message.Chat.IsDirectMessages:
-		b.onDirectMessage(ctx, update.Message)
 	case update.Message != nil && update.Message.IsAutomaticForward:
 		b.onDiscussionForward(ctx, update.Message)
 	case update.Message != nil && update.Message.Chat.Type == models.ChatTypePrivate:
 		b.onPrivateMessage(ctx, update.Message)
-	}
-}
-
-// onChannelPost attaches the "comment anonymously" deep link to a fresh post.
-func (b *Bot) onChannelPost(ctx context.Context, post *models.Message) {
-	if post.Chat.ID != b.cfg.Telegram.ChannelID {
-		return
-	}
-
-	markup := models.InlineKeyboardMarkup{
-		InlineKeyboard: [][]models.InlineKeyboardButton{{
-			{Text: b.cfg.Messages.ButtonComment, URL: b.comments.DeepLink(post.ID)},
-		}},
-	}
-
-	_, err := b.api.EditMessageReplyMarkup(ctx, &tgbot.EditMessageReplyMarkupParams{
-		ChatID:      post.Chat.ID,
-		MessageID:   post.ID,
-		ReplyMarkup: markup,
-	})
-	if err != nil {
-		b.log.Error("attach comment button", slog.Int("post_id", post.ID), slog.Any("error", err))
 	}
 }
 
@@ -105,109 +81,6 @@ func (b *Bot) onDiscussionForward(ctx context.Context, msg *models.Message) {
 	)
 }
 
-// onDirectMessage handles the channel's Direct Messages chat: a reader offering
-// a post, and the service messages Telegram sends once an admin decides. The bot
-// never approves anything itself — that happens in Telegram's own interface.
-func (b *Bot) onDirectMessage(ctx context.Context, msg *models.Message) {
-	switch {
-	case msg.SuggestedPostApproved != nil:
-		b.onSuggestionDecided(ctx, msg.SuggestedPostApproved.SuggestedPostMessage, suggestion.StatusApproved)
-	case msg.SuggestedPostDeclined != nil:
-		b.onSuggestionDecided(ctx, msg.SuggestedPostDeclined.SuggestedPostMessage, suggestion.StatusDeclined)
-	case msg.SuggestedPostApprovalFailed != nil:
-		b.onSuggestionDecided(ctx, msg.SuggestedPostApprovalFailed.SuggestedPostMessage, suggestion.StatusFailed)
-	case msg.SuggestedPostInfo != nil:
-		b.onSuggestionOffered(ctx, msg)
-	}
-}
-
-// onSuggestionOffered records a freshly offered post.
-func (b *Bot) onSuggestionOffered(ctx context.Context, msg *models.Message) {
-	author := suggestionAuthor(msg)
-	if author == 0 {
-		b.log.Debug("suggested post without an author", slog.Int("message_id", msg.ID))
-
-		return
-	}
-
-	media, err := extractMedia(msg)
-	if err != nil {
-		media = nil
-	}
-
-	sug, err := b.suggestions.Offered(ctx, suggestion.Suggestion{
-		UserID:      author,
-		Text:        messageBody(msg),
-		Media:       media,
-		DMChatID:    msg.Chat.ID,
-		DMMessageID: msg.ID,
-	})
-	if err != nil {
-		b.log.Error("record suggested post",
-			slog.Int64("user_id", author),
-			slog.Int("message_id", msg.ID),
-			slog.Any("error", err),
-		)
-
-		return
-	}
-
-	b.log.Info("suggested post recorded",
-		slog.Int64("suggestion_id", sug.ID),
-		slog.Int64("user_id", author),
-	)
-}
-
-// onSuggestionDecided records an admin's decision and, for an approval, checks
-// what it earned. Telegram redelivers service messages, so only the call that
-// actually moves the row hands anything out.
-func (b *Bot) onSuggestionDecided(ctx context.Context, offered *models.Message, status suggestion.Status) {
-	if offered == nil {
-		return
-	}
-
-	sug, approved, err := b.suggestions.Decided(ctx, offered.Chat.ID, offered.ID, status)
-	if err != nil {
-		b.log.Error("record suggestion decision",
-			slog.Int("message_id", offered.ID),
-			slog.String("status", string(status)),
-			slog.Any("error", err),
-		)
-
-		return
-	}
-
-	b.log.Info("suggestion decided",
-		slog.Int64("suggestion_id", sug.ID),
-		slog.String("status", string(status)),
-	)
-
-	if !approved {
-		return
-	}
-
-	b.award(ctx, achievement.Event{
-		Kind:   achievement.KindPost,
-		UserID: sug.UserID,
-		Text:   sug.Text,
-		At:     time.Now(),
-	})
-}
-
-// suggestionAuthor is the reader who offered the post. In a Direct Messages
-// topic the message's From is the channel, so the author lives on the topic.
-func suggestionAuthor(msg *models.Message) int64 {
-	if msg.DirectMessagesTopic != nil && msg.DirectMessagesTopic.User != nil {
-		return msg.DirectMessagesTopic.User.ID
-	}
-
-	if msg.From != nil {
-		return msg.From.ID
-	}
-
-	return 0
-}
-
 func (b *Bot) onPrivateMessage(ctx context.Context, msg *models.Message) {
 	if msg.From == nil {
 		return
@@ -222,9 +95,34 @@ func (b *Bot) onPrivateMessage(ctx context.Context, msg *models.Message) {
 		return
 	}
 
-	if strings.TrimSpace(msg.Text) == profileCommand {
+	switch strings.TrimSpace(msg.Text) {
+	case profileCommand:
 		b.wipe(ctx, msg.From.ID, msg.ID)
 		b.onProfile(ctx, msg)
+
+		return
+	case suggestCommand:
+		b.wipe(ctx, msg.From.ID, msg.ID)
+		b.onSuggest(ctx, msg)
+
+		return
+	case pendingCommand:
+		b.wipe(ctx, msg.From.ID, msg.ID)
+		b.onPendingPosts(ctx, msg)
+
+		return
+	case publishedCommand:
+		b.wipe(ctx, msg.From.ID, msg.ID)
+		b.onPublishedPosts(ctx, msg)
+
+		return
+	}
+
+	// A post the bot asked for outranks the comment flow: the author was told to
+	// write one, and nothing else in this chat is waiting on them.
+	if _, err := b.suggestions.Waiting(ctx, msg.From.ID); err == nil {
+		b.remember(ctx, msg.From.ID, msg.ID)
+		b.onPostText(ctx, msg)
 
 		return
 	}
@@ -288,7 +186,6 @@ func (b *Bot) onStart(ctx context.Context, msg *models.Message, payload string) 
 	b.remember(ctx, userID, prompt.ID)
 }
 
-// onComment stages what the author wrote and asks which mask to sign it with.
 func (b *Bot) onComment(ctx context.Context, msg *models.Message) {
 	userID := msg.From.ID
 
@@ -364,6 +261,14 @@ func profileText(p profile.Profile, m config.Profile) string {
 	b.WriteString(esc(fmt.Sprintf(m.Comments, p.Activity.Comments)))
 	b.WriteString("\n")
 	b.WriteString(esc(fmt.Sprintf(m.Replies, p.Activity.Replies)))
+	b.WriteString("\n")
+	b.WriteString(esc(fmt.Sprintf(m.Posts, p.Activity.Posts)))
+
+	// The in-flight line only matters when something is in flight.
+	if p.Activity.PostsPending > 0 {
+		b.WriteString("\n")
+		b.WriteString(esc(fmt.Sprintf(m.PostsPending, p.Activity.PostsPending)))
+	}
 
 	b.WriteString("\n\n")
 	b.WriteString(bold(withCount(m.AchievementsHead, len(p.Achievements))))
@@ -421,6 +326,8 @@ func esc(text string) string {
 
 func (b *Bot) onCallback(ctx context.Context, query *models.CallbackQuery) {
 	switch {
+	case suggestion.Owns(query.Data):
+		b.onSuggestionCallback(ctx, query)
 	case query.Data == comment.CancelCallback:
 		b.onCancel(ctx, query)
 	case strings.HasPrefix(query.Data, "nick:"):
@@ -459,6 +366,8 @@ func (b *Bot) onNicknameChosen(ctx context.Context, query *models.CallbackQuery)
 	// private chat from filling up with dead buttons.
 	b.replacePrompt(ctx, query, b.cfg.Messages.Published)
 
+	b.notifyReply(ctx, published)
+
 	b.award(ctx, achievement.Event{
 		Kind:    achievement.KindComment,
 		UserID:  published.UserID,
@@ -466,6 +375,37 @@ func (b *Bot) onNicknameChosen(ctx context.Context, query *models.CallbackQuery)
 		At:      published.CreatedAt,
 		IsReply: published.ReplyToCommentID != 0,
 	})
+}
+
+// notifyReply tells a comment's author that someone answered it.
+func (b *Bot) notifyReply(ctx context.Context, reply comment.Comment) {
+	notice, ok, err := b.comments.ReplyNotice(ctx, reply)
+	if err != nil {
+		b.log.Error("build reply notice", slog.Int64("comment_id", reply.ID), slog.Any("error", err))
+
+		return
+	}
+
+	if !ok {
+		return
+	}
+
+	markup := models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{{
+			{Text: b.cfg.Messages.ButtonOpenComment, URL: notice.Link},
+		}},
+	}
+
+	b.sendWithKeyboard(ctx, notice.RecipientID, replyNoticeText(b.cfg.Messages.ReplyNotice, notice), markup)
+}
+
+func replyNoticeText(head string, notice comment.ReplyNotice) string {
+	text := bold(head) + "\n\n" + bold(notice.Nickname)
+	if body := strings.TrimSpace(notice.Text); body != "" {
+		text += "\n" + esc(body)
+	}
+
+	return text
 }
 
 // award hands one event to the achievements layer and tells the author what it

@@ -775,3 +775,57 @@ func TestPublishReplyToDeletedComment(t *testing.T) {
 	assert.Empty(t, pub.requests, "nothing is published when the parent is gone")
 	assert.Empty(t, repo.comments, "and no row is left behind for it")
 }
+
+func TestReplyNotice(t *testing.T) {
+	t.Parallel()
+
+	parent := publishedComment()
+	reply := comment.Comment{
+		ID: 8, UserID: userID, PostID: postID, Nickname: fox.Label,
+		ReplyToCommentID: parent.ID, MessageID: 9100, Text: "ответ",
+		Status: comment.StatusPublished,
+	}
+
+	repo := fullRepo().withComment(parent)
+	svc := newService(t, repo, &fakePublisher{}, nil)
+
+	got, ok, err := svc.ReplyNotice(context.Background(), reply)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	assert.Equal(t, parent.UserID, got.RecipientID, "the parent's author is told, not the replier")
+	assert.Equal(t, fox.Label, got.Nickname, "only the mask is revealed")
+	assert.Equal(t, "ответ", got.Text)
+	assert.Equal(t, "https://t.me/anon_channel/42?comment=9100", got.Link, "the link opens the reply itself")
+}
+
+func TestReplyNoticeHasNobodyToTell(t *testing.T) {
+	t.Parallel()
+
+	parent := publishedComment()
+	repo := fullRepo().withComment(parent)
+	svc := newService(t, repo, &fakePublisher{}, nil)
+	ctx := context.Background()
+
+	topLevel := comment.Comment{ID: 8, UserID: userID, PostID: postID, MessageID: 9100}
+	_, ok, err := svc.ReplyNotice(ctx, topLevel)
+	require.NoError(t, err)
+	assert.False(t, ok, "a top-level comment answers nobody")
+
+	selfReply := comment.Comment{
+		ID: 8, UserID: parent.UserID, PostID: postID, MessageID: 9100, ReplyToCommentID: parent.ID,
+	}
+	_, ok, err = svc.ReplyNotice(ctx, selfReply)
+	require.NoError(t, err)
+	assert.False(t, ok, "answering yourself is not news")
+}
+
+func TestReplyNoticeParentGone(t *testing.T) {
+	t.Parallel()
+
+	svc := newService(t, fullRepo(), &fakePublisher{}, nil)
+
+	reply := comment.Comment{ID: 8, UserID: userID, PostID: postID, MessageID: 9100, ReplyToCommentID: 7}
+	_, _, err := svc.ReplyNotice(context.Background(), reply)
+	require.ErrorIs(t, err, comment.ErrNotFound)
+}

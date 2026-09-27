@@ -9,6 +9,7 @@ timezone = "Europe/Moscow"  # the clock achievement rules read; empty means UTC
 [telegram]
 mode = "polling"            # webhook — when there is time for TLS
 bot_username = "my_anon_bot"        # without @, used to build comment deep links
+channel_username = "my_channel"     # without @; empty falls back to a t.me/c/ link
 channel_id = -1001234567890         # the channel the bot watches
 discussion_chat_id = -1009876543210 # linked discussion group where comments are published
 debug = false
@@ -28,6 +29,10 @@ chat_id = -1001111111111    # private moderators chat
 max_text_len = 3500
 draft_ttl = "1h"          # how long a "comment" tap stays valid
 
+[posts]
+max_text_len = 3500
+pending_limit = 3          # posts one account may have awaiting a decision; 0 = no limit
+
 # Every line the bot shows a person. Each key is optional: leave one out and the
 # built-in Russian wording is used. An empty string is rejected at startup — it
 # would render as a blank button rather than fall back.
@@ -43,6 +48,8 @@ reply_prompt = "Напишите ответ. Медиа поддерживает
 choose_nickname = "Под каким псевдонимом отправить?"
 published = "Комментарий отправлен."
 achievement = "🏅 Получено новое достижение: %s"     # takes the achievement title
+reply_notice = "💬 Вам ответили"            # sent when someone answers your comment
+button_open_comment = "Открыть комментарий"
 cancelled = "Черновик удалён. Напишите новый комментарий."
 
 # Plain text, emoji welcome: the bot adds the bold and italic itself and escapes
@@ -51,9 +58,42 @@ cancelled = "Черновик удалён. Напишите новый комм
 title = "📊 Ваша статистика"
 comments = "💬 Комментариев: %d"
 replies = "↩️ Ответов: %d"
+posts = "📣 Постов опубликовано: %d"
+posts_pending = "📝 На рассмотрении: %d"
 achievements_head = "🏅 Достижения"
 no_achievements = "Пока ни одного — они открывают новые псевдонимы."
 nicknames_head = "🎭 Доступные псевдонимы"
+
+# The suggestion flow as its author sees it. Plain text, the bot adds markup.
+[messages.posts]
+button_edit = "✏️ Редактировать"
+button_withdraw = "🗑 Отменить"
+prompt = "Напишите свой пост"
+edit_prompt = "Перепишите свой пост заново!"
+sent = "Пост отправлен на рассмотрение"
+edited = "Пост обновлён — модераторы видят новый текст"
+withdrawn = "Предложка отменена"
+pending_head = "🕓 На рассмотрении"
+pending_empty = "Пока ничего не ждёт решения"
+published_head = "📣 Опубликованные посты"
+published_empty = "Пока ни один ваш пост не вышел."
+open_post = "Открыть пост"
+approved = "✅ Ваш пост опубликован."
+declined = "❌ Ваш пост отклонён."
+
+# The card in the moderation chat. Approving asks once more before publishing.
+[messages.moderation]
+head = "📝 Предложка"
+edited = "изменено автором"
+button_approve = "✅ Одобрить"
+button_decline = "❌ Отклонить"
+button_confirm = "Одобрить"
+button_cancel = "Отменить"
+confirm = "Опубликовать пост в канал?"
+published = "✅ Опубликовано"
+declined = "❌ Отклонено"
+withdrawn = "🗑 Отменено автором"
+failed = "⚠️ Не удалось опубликовать"
 
 [messages.errors]
 banned = "Вы не можете оставлять комментарии."
@@ -66,5 +106,11 @@ nickname = "Этот псевдоним больше недоступен, вы�
 empty = "Пустой комментарий: пришлите текст или медиа."
 too_long = "Комментарий слишком длинный, сократите текст."
 nothing_staged = "Нечего отправлять — сначала напишите комментарий."
+post_empty = "Пустой пост: пришлите текст или медиа."
+post_too_long = "Текст поста слишком длинный, сократите его."
+post_not_yours = "Это чужая предложка."
+post_not_pending = "Решение по этой предложке уже принято."
+post_limit = "Слишком много предложек ждёт решения. Дождитесь ответа по предыдущим."
+no_post_draft = "Сначала начните предложку командой /suggest."
 unsupported = "Такой тип вложения не поддерживается."
 internal = "Что-то пошло не так, попробуйте ещё раз позже."

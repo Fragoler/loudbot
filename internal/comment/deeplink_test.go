@@ -204,3 +204,13 @@ func TestPostLink(t *testing.T) {
 	private := comment.Post{ChannelMessageID: 42}
 	assert.Equal(t, "https://t.me/c/1234567890/42", comment.PostLink(private, -1001234567890))
 }
+
+func TestThreadLink(t *testing.T) {
+	t.Parallel()
+
+	public := comment.Post{ChannelMessageID: 42, ChannelUsername: "anon_channel"}
+	assert.Equal(t, "https://t.me/anon_channel/42?comment=9100", comment.ThreadLink(public, -1001234567890, 9100))
+
+	private := comment.Post{ChannelMessageID: 42}
+	assert.Equal(t, "https://t.me/c/1234567890/42?comment=9100", comment.ThreadLink(private, -1001234567890, 9100))
+}

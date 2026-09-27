@@ -18,11 +18,15 @@ type Achievement struct {
 	Description string
 }
 
-// Activity is how much of the channel's conversation one person has written.
+// Activity is how much of the channel one person has written.
 type Activity struct {
 	// Comments counts published top-level comments, Replies published answers.
 	Comments int
 	Replies  int
+	// Posts is suggestions that reached the channel; PostsPending still await a
+	// decision.
+	Posts        int
+	PostsPending int
 }
 
 // Profile is everything the bot shows a person about themselves.

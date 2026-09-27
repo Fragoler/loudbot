@@ -85,7 +85,10 @@ func run(configPath string) error {
 		return fmt.Errorf("config: %w", err)
 	}
 	bot.UseAwarder(achievement.New(store, location, log))
-	bot.UseSuggestions(suggestion.New(store))
+	bot.UseSuggestions(suggestion.New(store, suggestion.Options{
+		MaxTextLen:   cfg.Posts.MaxTextLen,
+		PendingLimit: cfg.Posts.PendingLimit,
+	}))
 
 	return bot.Run(ctx)
 }

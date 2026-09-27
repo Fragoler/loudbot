@@ -257,3 +257,44 @@ func TestDefaultMessagesAreComplete(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, cfg.Validate())
 }
+
+func TestPostSettings(t *testing.T) {
+	t.Setenv(config.EnvBotToken, "t")
+
+	cfg, err := config.Load(write(t, validTOML))
+	require.NoError(t, err)
+	assert.Equal(t, 3, cfg.Posts.PendingLimit, "defaults apply when [posts] is absent")
+
+	cfg, err = config.Load(write(t, validTOML+"\n[posts]\npending_limit = 0\n"))
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Posts.PendingLimit, "zero is a valid setting: no limit at all")
+}
+
+func TestPostSettingsAreValidated(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "negative limit",
+			body: "[posts]\npending_limit = -1\n",
+			want: "posts.pending_limit",
+		},
+		{
+			name: "zero text limit",
+			body: "[posts]\nmax_text_len = 0\n",
+			want: "posts.max_text_len",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(config.EnvBotToken, "t")
+
+			_, err := config.Load(write(t, validTOML+"\n"+tc.body))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}

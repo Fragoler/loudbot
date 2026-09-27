@@ -538,3 +538,43 @@ func (s *Service) OnPostPublished(ctx context.Context, post Post) error {
 
 	return nil
 }
+
+// ReplyNotice is what the author of a comment is told when someone answers it.
+type ReplyNotice struct {
+	RecipientID int64
+	Nickname    string
+	Text        string
+	// Link opens the thread at the reply itself.
+	Link string
+}
+
+// ReplyNotice builds the notice for the author of the comment a reply answers.
+// ok is false when there is nobody to tell: a top-level comment, or someone
+// answering themselves. The recipient learns the mask and the words, never who
+// is behind them.
+func (s *Service) ReplyNotice(ctx context.Context, reply Comment) (ReplyNotice, bool, error) {
+	if reply.ReplyToCommentID == 0 || reply.MessageID == 0 {
+		return ReplyNotice{}, false, nil
+	}
+
+	parent, err := s.repo.Comment(ctx, reply.ReplyToCommentID)
+	if err != nil {
+		return ReplyNotice{}, false, fmt.Errorf("parent comment: %w", err)
+	}
+
+	if parent.UserID == reply.UserID {
+		return ReplyNotice{}, false, nil
+	}
+
+	post, err := s.repo.Post(ctx, reply.PostID)
+	if err != nil {
+		return ReplyNotice{}, false, fmt.Errorf("post: %w", err)
+	}
+
+	return ReplyNotice{
+		RecipientID: parent.UserID,
+		Nickname:    reply.Nickname,
+		Text:        reply.Text,
+		Link:        ThreadLink(post, s.opts.ChannelID, reply.MessageID),
+	}, true, nil
+}

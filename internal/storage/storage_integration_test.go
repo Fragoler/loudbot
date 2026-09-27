@@ -128,7 +128,7 @@ func restoreSeed(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 const reset = `
 TRUNCATE posts, comment_drafts, comments, suggested_posts, reports, identity_map,
          audit_log, users, private_messages, user_achievements, achievement_nicknames,
-         achievement_rules, achievements, suggested_posts
+         achievement_rules, achievements, suggestion_drafts, suggested_posts
 RESTART IDENTITY CASCADE`
 
 // Masks live in the nicknames table, seeded by the migration.
@@ -682,8 +682,10 @@ func TestCountersFeedTheRules(t *testing.T) {
 		`INSERT INTO user_achievements (user_id, achievement_id) VALUES ($1, $2)`, user, achievementID)
 	require.NoError(t, err)
 
-	// Approved suggestions count as posts; the flow does not exist yet, so a row
-	// is written by hand to prove the query reads the right column.
+	// Published suggestions count as posts; one merely queued does not.
+	_, err = conn.Exec(ctx,
+		`INSERT INTO suggested_posts (user_id, content_text, status) VALUES ($1, 'текст', 'published')`, user)
+	require.NoError(t, err)
 	_, err = conn.Exec(ctx,
 		`INSERT INTO suggested_posts (user_id, content_text, status) VALUES ($1, 'текст', 'approved')`, user)
 	require.NoError(t, err)
@@ -721,56 +723,141 @@ func TestRuleWithNoConditionIsRefused(t *testing.T) {
 func TestSuggestionLifecycle(t *testing.T) {
 	st, ctx := open(t)
 
-	const (
-		user      = int64(10_015)
-		dmChat    = int64(-100_777)
-		messageID = 55
-	)
+	const user = int64(10_015)
 
 	_, err := st.EnsureUser(ctx, user)
 	require.NoError(t, err)
 
-	_, err = st.SuggestionByMessage(ctx, dmChat, messageID)
+	_, err = st.Suggestion(ctx, 999_999)
 	require.ErrorIs(t, err, suggestion.ErrNotFound)
 
 	created := time.Now().UTC().Truncate(time.Millisecond)
 	id, err := st.CreateSuggestion(ctx, suggestion.Suggestion{
-		UserID:      user,
-		Text:        "предлагаю пост",
-		Media:       []comment.Media{{Type: comment.MediaPhoto, FileID: "f1", FileUniqueID: "u1"}},
-		Status:      suggestion.StatusPending,
-		DMChatID:    dmChat,
-		DMMessageID: messageID,
-		CreatedAt:   created,
+		UserID:    user,
+		Text:      "предлагаю пост",
+		Media:     []comment.Media{{Type: comment.MediaPhoto, FileID: "f1", FileUniqueID: "u1"}},
+		Status:    suggestion.StatusPending,
+		CreatedAt: created,
 	})
 	require.NoError(t, err)
 	require.NotZero(t, id)
 
-	// A decision's service message carries the original message, not our id.
-	got, err := st.SuggestionByMessage(ctx, dmChat, messageID)
+	got, err := st.Suggestion(ctx, id)
 	require.NoError(t, err)
-	assert.Equal(t, id, got.ID)
 	assert.Equal(t, user, got.UserID)
 	assert.Equal(t, "предлагаю пост", got.Text)
 	assert.Equal(t, suggestion.StatusPending, got.Status)
 	require.Len(t, got.Media, 1)
 	assert.Equal(t, "f1", got.Media[0].FileID)
+	assert.Zero(t, got.ModerationMessageID, "a NULL card id reads back as zero")
+	assert.Nil(t, got.EditedAt, "an untouched post has no edit time")
 	assert.WithinDuration(t, created, got.CreatedAt, time.Millisecond)
+
+	require.NoError(t, st.SetModerationMessage(ctx, id, 500))
+
+	// An edit keeps the row and its card, and records when it happened.
+	editedAt := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, st.UpdateSuggestionText(ctx, id, "другой текст", nil, editedAt))
+
+	got, err = st.Suggestion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, "другой текст", got.Text)
+	assert.Empty(t, got.Media, "a nil slice reads back empty, not null")
+	assert.Equal(t, 500, got.ModerationMessageID)
+	require.NotNil(t, got.EditedAt)
+
+	waiting, err := st.SuggestionsByStatus(ctx, user, suggestion.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, waiting, 1)
 
 	// A pending suggestion is not an approved post.
 	counters, err := st.Counters(ctx, user)
 	require.NoError(t, err)
 	assert.Zero(t, counters.Posts)
 
+	// Approved but not yet sent is not a post.
 	require.NoError(t, st.SetSuggestionStatus(ctx, id, suggestion.StatusApproved, time.Now().UTC()))
-
-	got, err = st.SuggestionByMessage(ctx, dmChat, messageID)
-	require.NoError(t, err)
-	assert.Equal(t, suggestion.StatusApproved, got.Status)
 
 	counters, err = st.Counters(ctx, user)
 	require.NoError(t, err)
-	assert.Equal(t, 1, counters.Posts, "an approved suggestion is what a post rule counts")
+	assert.Zero(t, counters.Posts, "an approval that never reached the channel is not a post")
+
+	require.NoError(t, st.SetChannelMessage(ctx, id, 4242))
+	require.NoError(t, st.SetSuggestionStatus(ctx, id, suggestion.StatusPublished, time.Now().UTC()))
+
+	got, err = st.Suggestion(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, suggestion.StatusPublished, got.Status)
+	assert.Equal(t, 4242, got.ChannelMessageID)
+
+	published, err := st.SuggestionsByStatus(ctx, user, suggestion.StatusPublished)
+	require.NoError(t, err)
+	require.Len(t, published, 1)
+
+	waiting, err = st.SuggestionsByStatus(ctx, user, suggestion.StatusPending)
+	require.NoError(t, err)
+	assert.Empty(t, waiting)
+
+	counters, err = st.Counters(ctx, user)
+	require.NoError(t, err)
+	assert.Equal(t, 1, counters.Posts, "a published suggestion is what a post rule counts")
+
+	assert.Equal(t, 1, mustCount(ctx, t, st, user, suggestion.StatusPublished))
+	assert.Zero(t, mustCount(ctx, t, st, user, suggestion.StatusApproved))
+}
+
+func TestSuggestionStatusIsConstrained(t *testing.T) {
+	st, ctx := open(t)
+
+	const user = int64(10_016)
+
+	_, err := st.EnsureUser(ctx, user)
+	require.NoError(t, err)
+
+	id, err := st.CreateSuggestion(ctx, suggestion.Suggestion{
+		UserID: user, Text: "текст", Status: suggestion.StatusPending, CreatedAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+
+	_, err = probe(ctx, t).Exec(ctx, `UPDATE suggested_posts SET status = 'whatever' WHERE id = $1`, id)
+	require.Error(t, err, "the schema refuses a status the bot cannot produce")
+	assert.Contains(t, err.Error(), "suggested_posts_status_check")
+}
+
+func TestSuggestionDrafts(t *testing.T) {
+	st, ctx := open(t)
+
+	const user = int64(10_017)
+
+	_, err := st.EnsureUser(ctx, user)
+	require.NoError(t, err)
+
+	_, err = st.SuggestionDraft(ctx, user)
+	require.ErrorIs(t, err, suggestion.ErrNotFound)
+
+	require.NoError(t, st.SaveSuggestionDraft(ctx, suggestion.Draft{UserID: user, CreatedAt: time.Now().UTC()}))
+
+	draft, err := st.SuggestionDraft(ctx, user)
+	require.NoError(t, err)
+	assert.False(t, draft.Editing(), "a NULL editing_id reads back as zero, not as post 0")
+
+	id, err := st.CreateSuggestion(ctx, suggestion.Suggestion{
+		UserID: user, Text: "текст", Status: suggestion.StatusPending, CreatedAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, st.SaveSuggestionDraft(ctx, suggestion.Draft{
+		UserID: user, EditingID: id, CreatedAt: time.Now().UTC(),
+	}))
+
+	draft, err = st.SuggestionDraft(ctx, user)
+	require.NoError(t, err)
+	assert.True(t, draft.Editing())
+	assert.Equal(t, id, draft.EditingID)
+
+	require.NoError(t, st.DeleteSuggestionDraft(ctx, user))
+	_, err = st.SuggestionDraft(ctx, user)
+	require.ErrorIs(t, err, suggestion.ErrNotFound)
 }
 
 func TestRuleEventColumn(t *testing.T) {
@@ -801,4 +888,40 @@ func TestRuleEventColumn(t *testing.T) {
 		`INSERT INTO achievement_rules (achievement_id, event, min_length) VALUES ($1, 'telepathy', 1)`,
 		achievementID)
 	require.Error(t, err, "the schema refuses a kind the bot cannot produce")
+}
+
+// mustCount is CountSuggestions without the error handling at every call site.
+func mustCount(
+	ctx context.Context, t *testing.T, st *storage.Storage, userID int64, statuses ...suggestion.Status,
+) int {
+	t.Helper()
+
+	n, err := st.CountSuggestions(ctx, userID, statuses...)
+	require.NoError(t, err)
+
+	return n
+}
+
+func TestActivityCountsPostsByStage(t *testing.T) {
+	st, ctx := open(t)
+
+	const user = int64(10_018)
+
+	_, err := st.EnsureUser(ctx, user)
+	require.NoError(t, err)
+
+	conn := probe(ctx, t)
+	for _, status := range []string{"published", "published", "pending", "declined"} {
+		_, err := conn.Exec(ctx,
+			`INSERT INTO suggested_posts (user_id, content_text, status) VALUES ($1, 'текст', $2)`,
+			user, status)
+		require.NoError(t, err)
+	}
+
+	got, err := st.Activity(ctx, user)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, got.Posts)
+	assert.Equal(t, 1, got.PostsPending)
+	assert.Zero(t, got.Comments, "a declined post is counted nowhere")
 }
